@@ -1,0 +1,353 @@
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <title></title>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/2.2.4/jquery.min.js"></script>
+    <script src="https://ajax.googleapis.com/ajax/libs/jqueryui/1.12.0/jquery-ui.min.js"></script>
+    <script src="./pdf.js"></script>
+    <script src="./pdf.worker.js"></script>
+    <script src="./openpgp.min.js"></script>
+    <link rel="stylesheet" href="https://ajax.googleapis.com/ajax/libs/jqueryui/1.12.0/themes/smoothness/jquery-ui.css">
+    <style>
+        input.text,
+        textarea.text {
+            margin-bottom: 12px;
+            width: 95%;
+            padding: .4em;
+            font-family: Courier New, Courier, monospace;
+            font-size: 14px;
+        }
+        
+        fieldset {
+            padding: 0;
+            border: 0;
+            margin-top: 25px;
+        }
+        
+        .validateTips {
+            border: 1px solid transparent;
+            padding: 0.3em;
+        }
+        
+        body {
+            font-family: Arial, Helvetica, sans-serif;
+        }
+        
+        .ui-draggable,
+        .ui-droppable {
+            background-position: top;
+        }
+        
+        #the-canvas {
+            border: 1px solid black;
+        }
+    </style>
+    <script type="text/javascript">
+
+    
+        // save the workbook object (TODO: refactor)
+        var savedWorkbook;
+
+        var sheetName, fieldName;
+		var workbook;
+        var pgpMessage, pgpPriv, pgpPrivPass, pgpPub, pgpSave;
+        var dialog, form;
+        var pdfDoc = null,
+            pageNum = 1,
+            pageRendering = false,
+            pageNumPending = null,
+            scale = 1.2;
+
+        function getTableau(){
+				if (!parent) return null;
+				if (!parent.parent) return null;
+                return parent.parent.tableau;
+            }
+
+        function getCurrentViz() {
+			var tableau = getTableau();
+			if (!tableau) return null;
+            return tableau.VizManager.getVizs()[0];
+        }
+
+        function getCurrentWorkbook() {
+			var viz = getCurrentViz();
+			if (!viz) return null;
+            return viz.getWorkbook();
+        }
+
+        function getSheet(sheetName) {
+			var currentWorkbook = getCurrentWorkbook();
+			if (!currentWorkbook) return null;
+            return currentWorkbook.getActiveSheet().getWorksheets().get(sheetName);
+        }
+
+        function getParameters(parameters) {
+            for (i = 0; i < parameters.length; i++) {
+                if (parameters[i].getName().lastIndexOf("decryptPdf_", 0) === 0) {
+                    processParam(parameters[i].getName(), parameters[i].getCurrentValue().value);
+                }
+            }
+        }
+
+        processParam = function(parameter, value) {
+            parameter = parameter.substr(11); // Trim 'decryptPdf_' from the beginning
+
+            switch (parameter) {
+                case "sheet":
+                    sheetName = value;
+                    break;
+                case "field":
+                    fieldName = value;
+                    break;
+                default:
+                    console.log("DecryptPdf parameter received but could not be processed (" + parameter +
+                        "). Check if the parameter name is among the accepted ones.");
+            }
+            return true;
+        };
+
+        onMarkChange = function(marks) {
+            // if (savedWorkbook) {
+            //     savedWorkbook.getParametersAsync().then( (params)=> console.log("params", params), console.error);
+            // }
+            
+            sheet = getSheet(sheetName);
+
+			if (!sheet) return;
+            options = {
+                maxRows: 1, // Max rows to return. Use 0 to return all rows
+                ignoreAliases: false,
+                ignoreSelection: false,
+                includeAllColumns: true
+            };
+
+            sheet.getUnderlyingDataAsync(options).then(function(t) {
+                var openpgp_data = t;
+                cols = openpgp_data.getColumns();
+                data = openpgp_data.getData();
+                fieldNameMap = $.map(cols, function(col) {
+                    return col.$0.$1;
+                });
+                formattedData = $.map(data, function(d) {
+                    return d.reduce(function(memo, value, idx) {
+                        memo[fieldNameMap[idx]] = value.formattedValue;
+                        return memo;
+                    }, {});
+                });
+
+                pgpMessage = formattedData[0][fieldName];
+                workbook = getCurrentWorkbook();
+                decryptAndDisplayPdf();
+            });
+        };
+
+        getOpenPgp = function() {
+            var valid = true;
+            // We'll need some proper validation here...
+            if (valid) {
+                pgpPriv = $("#pgpFormPriv").val();
+                pgpPrivPass = $("#pgpFormPrivPass").val();
+                pgpPub = $("#pgpFormPub").val();
+                pgpSave = $("#pgpFormSave").is(':checked');
+                dialog.dialog("close");
+            }
+            decryptAndDisplayPdf();
+        };
+
+        decryptAndDisplayPdf = function() {
+            if (pgpPriv === undefined || pgpPrivPass === undefined) {
+				workbook = getCurrentWorkbook();
+				if (!workbook) return;
+				workbook.changeParameterValueAsync("showHide", "hide");
+                dialog.dialog("open");
+                return;
+            }
+
+            workbook.changeParameterValueAsync("showHide", "show");
+
+            // Decrypt the PGP Message
+            try {
+                var privKeyObj = openpgp.key.readArmored(pgpPriv).keys[0];
+
+                privKeyObj.decrypt(pgpPrivPass);
+
+                options = {
+                    message: openpgp.message.readArmored(pgpMessage), // parse armored message
+                    publicKeys: openpgp.key.readArmored(pgpPub).keys, // for verification (optional)
+                    privateKey: privKeyObj // for decryption
+                };
+
+                openpgp.decrypt(options).then(function(plaintext) {
+                    // Display the PDF
+                    PDFJS.disableWorker = true;
+                    PDFJS.workerSrc = 'pdf.worker.js';
+
+                    var loadingTask = PDFJS.getDocument({
+                        data: plaintext.data
+                    });
+
+                    loadingTask.promise.then(function(pdf) {
+
+                        // Fetch the first page
+                        pdfDoc = pdf;
+                        parent.parent.document.getElementById('page_count').textContent = pdfDoc.numPages;
+                        renderPage(1);
+
+                    }, function(reason) {
+                        // PDF loading error
+                        console.error(reason);
+                    });
+                });
+            } catch (e) {
+                console.error("Yo. Invalid credentials. Check your private key, and pass phrase, and try again. xoxo");
+            }
+            
+            // If Save credentials was set to false clear them
+            if (pgpSave === false) {
+                pgpPriv = undefined;
+                pgpPrivPass = undefined;
+                pgpPub = undefined;
+            }
+        };
+
+        renderPage = function(num) {
+            pageRendering = true;
+            // Using promise to fetch the page
+            pdfDoc.getPage(num).then(function(page) {
+                
+                parent.parent.document.getElementById('pgpPDFViewer').style.display = 'block';
+                var viewport = page.getViewport(scale);
+                var canvas = parent.parent.document.getElementById('the-canvas');
+                var context = canvas.getContext('2d');
+
+                canvas.height = viewport.height;
+                canvas.width = viewport.width;
+
+                // Render PDF page into canvas context
+                var renderContext = {
+                    canvasContext: context,
+                    viewport: viewport
+                };
+                var renderTask = page.render(renderContext);
+
+                // Wait for rendering to finish
+                renderTask.promise.then(function() {
+                    pageRendering = false;
+                    if (pageNumPending !== null) {
+                        // New page rendering is pending
+                        renderPage(pageNumPending);
+                        pageNumPending = null;
+                    }
+                });
+            });
+
+            // Update page counters
+            parent.parent.document.getElementById('page_num').textContent = pageNum;
+        }
+
+        queueRenderPage = function(num) {
+            if (pageRendering) {
+                pageNumPending = num;
+            } else {
+                renderPage(num);
+            }
+        }
+
+        onPrevPage = function() {
+            if (pageNum <= 1) {
+                return;
+            }
+            pageNum--;
+            queueRenderPage(pageNum);
+        }
+        
+        onNextPage = function() {
+            if (pageNum >= pdfDoc.numPages) {
+                return;
+            }
+            pageNum++;
+            queueRenderPage(pageNum);
+        }
+		
+		zoomin = function() {
+			scale += .2;
+			queueRenderPage(pageNum);
+		}
+		
+		zoomout = function() {
+			scale -= .2;
+			queueRenderPage(pageNum);
+		}
+        
+        initDecryptPdf = function() {
+            var tableau = getTableau();
+            workbook = getCurrentWorkbook();
+            var viz = getCurrentViz();
+        	
+			if (!viz) return;
+            savedWorkbook = getCurrentWorkbook();
+            
+            viz.addEventListener(tableau.TableauEventName.MARKS_SELECTION, onMarkChange);
+
+            workbook.getParametersAsync().then( getParameters);
+
+            var tgt = parent.parent.document;
+			tgt.getElementById('prev').addEventListener('click', onPrevPage);
+			tgt.getElementById('next').addEventListener('click', onNextPage);
+			tgt.getElementById('zoomin').addEventListener('click', zoomin);
+			tgt.getElementById('zoomout').addEventListener('click', zoomout);
+
+            
+            dialog = $("#pgpForm").dialog({
+                autoOpen: false,
+                height: 600,
+                width: 675,
+                modal: true,
+                buttons: {
+                    "Decrypt": getOpenPgp,
+                    Cancel: function() {
+                        dialog.dialog("close");
+                    }
+                },
+                close: function() {
+                    form[0].reset();
+                }
+            });
+
+            form = dialog.find("form").on("submit", function(event) {
+                event.preventDefault();
+                getOpenPgp();
+            });
+
+            
+        };
+
+        this.appApi = {
+            initDecryptPdf: initDecryptPdf
+        };
+    </script>
+
+</head>
+
+<body onload="appApi.initDecryptPdf();">
+    <div id="pgpForm" title="Enter OpenPGP key details">
+        <form>
+            <fieldset>
+                <label for="pgpFormPriv">OpenPGP Private key for decryption</label><br/>
+                <textarea id="pgpFormPriv" name="pgpFormPriv" rows="6" class="text ui-widget-content ui-corner-all"></textarea><br/>
+                <label for="pgpFormPrivPass">Passphrase for the private key</label><br/>
+                <input type="password" name="pgpFormPrivPass" id="pgpFormPrivPass" value="" class="text ui-widget-content ui-corner-all"><br/>
+                <label for="pgpFormPub">OpenPGP Public key for validation (optional)</label><br/>
+                <textarea id="pgpFormPub" name="pgpFormPub" rows="6" class="text ui-widget-content ui-corner-all"></textarea><br/>
+                <label for="pgpFormSave">Save key details for this session</label><br/>
+                <input type="checkbox" id="pgpFormSave" name="pgpFormSave" value="save"><br/>
+                <!-- Allow form submission with keyboard without duplicating the dialog button -->
+                <input type="submit" tabindex="-1" style="position:absolute; top:-1000px">
+            </fieldset>
+        </form>
+    </div>
+</body>
+
+</html>
